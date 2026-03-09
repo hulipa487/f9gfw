@@ -1,0 +1,39 @@
+# Zig build artifacts
+.zig-cache/
+zig-out/
+zig-build-*/
+
+# Build outputs
+*.exe
+*.dll
+*.so
+*.dylib
+*.o
+*.obj
+*.lib
+*.a
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+.claude
+
+# Test coverage
+coverage/
+
+# Debug files
+*.pdb
+*.ilk
+*.log
+
+# Temporary files
+*.tmp
+*.temp
+
+# LLM Files
+PLAN.md
+CLAUDE.md

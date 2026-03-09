@@ -1,0 +1,179 @@
+const std = @import("std");
+
+const shared = @import("shared");
+const winsock_mod = @import("winsock.zig");
+const tunnel_mod = @import("tunnel.zig");
+
+const Cipher = shared.crypto.Cipher;
+const Winsock = winsock_mod.Winsock;
+const ClientTunnel = tunnel_mod.ClientTunnel;
+const LocalListener = tunnel_mod.LocalListener;
+
+const DEFAULT_LOCAL_PORT: u16 = 1080;
+const DEFAULT_PROXY_PORT: u16 = 51820;
+const DEFAULT_TTL: u8 = 2;
+
+pub const std_options: std.Options = .{
+    .log_level = .info,
+};
+
+fn parseArgs(allocator: std.mem.Allocator) !struct {
+    local_port: u16,
+    forward_addr: []const u8,
+    forward_port: u16,
+    proxy_addr: []const u8,
+    proxy_port: u16,
+    key: []const u8,
+    ttl: u8,
+} {
+    var args = try std.process.argsWithAllocator(allocator);
+    defer args.deinit();
+
+    var local_port: u16 = DEFAULT_LOCAL_PORT;
+    var forward_addr: ?[]const u8 = null;
+    var forward_port: u16 = 80;
+    var proxy_addr: ?[]const u8 = null;
+    var proxy_port: u16 = DEFAULT_PROXY_PORT;
+    var key: ?[]const u8 = null;
+    var ttl: u8 = DEFAULT_TTL;
+
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "-l")) {
+            const port_str = args.next() orelse return error.MissingArgument;
+            local_port = try std.fmt.parseInt(u16, port_str, 10);
+        } else if (std.mem.eql(u8, arg, "-f")) {
+            forward_addr = args.next() orelse return error.MissingArgument;
+            // Parse "ip:port" format
+            if (std.mem.indexOfScalar(u8, forward_addr.?, ':')) |colon| {
+                forward_port = try std.fmt.parseInt(u16, forward_addr.?[colon + 1 ..], 10);
+                forward_addr = forward_addr.?[0..colon];
+            }
+        } else if (std.mem.eql(u8, arg, "-c")) {
+            proxy_addr = args.next() orelse return error.MissingArgument;
+            // Parse "ip:port" format
+            if (std.mem.indexOfScalar(u8, proxy_addr.?, ':')) |colon| {
+                proxy_port = try std.fmt.parseInt(u16, proxy_addr.?[colon + 1 ..], 10);
+                proxy_addr = proxy_addr.?[0..colon];
+            }
+        } else if (std.mem.eql(u8, arg, "-p")) {
+            const port_str = args.next() orelse return error.MissingArgument;
+            proxy_port = try std.fmt.parseInt(u16, port_str, 10);
+        } else if (std.mem.eql(u8, arg, "-k")) {
+            key = args.next() orelse return error.MissingArgument;
+        } else if (std.mem.eql(u8, arg, "--ttl")) {
+            const ttl_str = args.next() orelse return error.MissingArgument;
+            ttl = try std.fmt.parseInt(u8, ttl_str, 10);
+        } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
+            printUsage();
+            std.process.exit(0);
+        }
+    }
+
+    return .{
+        .local_port = local_port,
+        .forward_addr = forward_addr orelse return error.MissingForwardAddr,
+        .forward_port = forward_port,
+        .proxy_addr = proxy_addr orelse return error.MissingProxyAddr,
+        .proxy_port = proxy_port,
+        .key = key orelse return error.MissingKey,
+        .ttl = ttl,
+    };
+}
+
+fn printUsage() void {
+    std.log.info(
+        \\f9gfwc - TCP/UDP Proxy Client
+        \\
+        \\Usage: f9gfwc -f <forward_addr> -c <proxy_addr> -k <key> [options]
+        \\
+        \\Options:
+        \\  -l <port>           Local TCP listen port (default: {d})
+        \\  -f <ip[:port]>      Forward address (destination server)
+        \\  -c <ip[:port]>      Proxy server address
+        \\  -p <port>           Proxy UDP port (default: {d})
+        \\  -k <key>            Pre-shared encryption key (required)
+        \\  --ttl <n>           TTL for NAT traversal SYNs (default: {d})
+        \\  -h, --help          Show this help message
+        \\
+        \\Example:
+        \\  f9gfwc -l 1080 -f 93.184.216.34:80 -c 192.168.1.100 -p 51820 -k mysecretkey --ttl 2
+        \\
+    , .{ DEFAULT_LOCAL_PORT, DEFAULT_PROXY_PORT, DEFAULT_TTL });
+}
+
+fn parseIPv4(addr_str: []const u8) ![4]u8 {
+    var iter = std.mem.splitScalar(u8, addr_str, '.');
+    var ip: [4]u8 = undefined;
+    var i: usize = 0;
+    while (iter.next()) |octet| {
+        if (i >= 4) return error.InvalidIPAddress;
+        ip[i] = try std.fmt.parseInt(u8, octet, 10);
+        i += 1;
+    }
+    if (i != 4) return error.InvalidIPAddress;
+    return ip;
+}
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const args = parseArgs(allocator) catch |err| {
+        std.log.err("Failed to parse arguments: {}", .{err});
+        printUsage();
+        std.process.exit(1);
+    };
+
+    // Parse IP addresses
+    const forward_ip = parseIPv4(args.forward_addr) catch |err| {
+        std.log.err("Invalid forward address: {}", .{err});
+        std.process.exit(1);
+    };
+    const proxy_ip = parseIPv4(args.proxy_addr) catch |err| {
+        std.log.err("Invalid proxy address: {}", .{err});
+        std.process.exit(1);
+    };
+
+    // Derive encryption key
+    const key = Cipher.deriveKey(args.key);
+
+    std.log.info("Starting f9gfw client", .{});
+    std.log.info("Local: 127.0.0.1:{}", .{args.local_port});
+    std.log.info("Forward: {}.{}.{}.{}:{}", .{ forward_ip[0], forward_ip[1], forward_ip[2], forward_ip[3], args.forward_port });
+    std.log.info("Proxy: {}.{}.{}.{}:{}", .{ proxy_ip[0], proxy_ip[1], proxy_ip[2], proxy_ip[3], args.proxy_port });
+    std.log.info("TTL: {}", .{args.ttl});
+
+    // Initialize tunnel
+    var tunnel = ClientTunnel.init(
+        allocator,
+        key,
+        proxy_ip,
+        args.proxy_port,
+        forward_ip,
+        args.forward_port,
+        args.local_port,
+        args.ttl,
+    ) catch |err| {
+        std.log.err("Failed to initialize tunnel: {}", .{err});
+        std.process.exit(1);
+    };
+    defer tunnel.deinit();
+
+    // Create NAT entry via TTL-limited SYN
+    tunnel.createNATEntry() catch |err| {
+        std.log.warn("Failed to create NAT entry (non-fatal): {}", .{err});
+    };
+
+    // Start local listener
+    var listener = LocalListener.init(&tunnel, args.local_port) catch |err| {
+        std.log.err("Failed to start listener: {}", .{err});
+        std.process.exit(1);
+    };
+    defer listener.deinit();
+
+    listener.run() catch |err| {
+        std.log.err("Listener error: {}", .{err});
+        std.process.exit(1);
+    };
+}
