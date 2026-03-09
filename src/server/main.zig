@@ -32,10 +32,10 @@ const Server = struct {
         listen_addr: std.net.Address,
         key: [32]u8,
     ) !Server {
-        const udp_ring = try UdpRing.init(allocator, listen_addr);
+        var udp_ring = try UdpRing.init(allocator, listen_addr);
         errdefer udp_ring.deinit();
 
-        const pkt_injector = try PacketInjector.init();
+        var pkt_injector = try PacketInjector.init();
         errdefer pkt_injector.deinit();
 
         return .{
@@ -55,7 +55,7 @@ const Server = struct {
     }
 
     pub fn run(self: *Server) !void {
-        std.log.info("Server listening on {}", .{self.listen_addr});
+        std.log.info("Server listening on {f}", .{self.listen_addr});
 
         // Prepare initial receive
         try self.udp_ring.prepareRecv(@intFromEnum(iouring.OpTag.recv));
@@ -145,6 +145,11 @@ const Server = struct {
         // Parse IP header to get destination
         const ip_header = try packet.IPv4Header.parse(tcp_packet);
         const dest_ip = ip_header.getDestIP();
+        const header_len = @as(usize, ip_header.ihl) * 4;
+
+        // Parse TCP header to get destination port
+        const tcp_header = try packet.TCPHeader.parse(tcp_packet[header_len..]);
+        const dest_port = tcp_header.dest_port;
 
         // Rewrite source IP to client's original IP
         // This makes the packet appear to come from the original client
@@ -157,7 +162,7 @@ const Server = struct {
         try packet.rewriteSourceIP(packet_copy, new_src_ip);
 
         // Inject packet into kernel
-        _ = try self.injector.inject(packet_copy, dest_ip, ip_header.getDestPort());
+        _ = try self.injector.inject(packet_copy, dest_ip, dest_port);
 
         std.log.debug("Injected packet: {} bytes, session {}", .{ tcp_packet.len, session_id });
     }
@@ -179,7 +184,7 @@ const Server = struct {
         const session = try self.sessions.createSession(conn_id, client_addr);
         session.state = .established;
 
-        std.log.info("New connection: {} -> {} (session {})", .{
+        std.log.info("New connection: {f} -> {f} (session {})", .{
             conn_id.src,
             conn_id.dst,
             session.id,

@@ -4,6 +4,9 @@ const shared = @import("shared");
 
 const packet = shared.packet;
 
+/// IP_HDRINCL socket option (Linux constant)
+const IP_HDRINCL: i32 = 3;
+
 /// Raw socket for injecting TCP packets into the kernel network stack
 pub const PacketInjector = struct {
     fd: i32,
@@ -22,7 +25,7 @@ pub const PacketInjector = struct {
         try std.posix.setsockopt(
             fd,
             std.posix.IPPROTO.IP,
-            std.posix.IP.HDRINCL,
+            IP_HDRINCL,
             std.mem.asBytes(&opt),
         );
 

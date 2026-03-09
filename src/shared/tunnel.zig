@@ -25,17 +25,9 @@ pub const Endpoint = struct {
 
     pub fn format(
         self: Endpoint,
-        comptime fmt: []const u8,
-        options: std.fmt.FormatOptions,
-        writer: anytype,
-    ) !void {
-        _ = fmt;
-        _ = options;
-        try std.fmt.format(
-            writer,
-            "{}.{}.{}.{}:{}",
-            .{ self.ip[0], self.ip[1], self.ip[2], self.ip[3], self.port },
-        );
+        w: *std.Io.Writer,
+    ) std.Io.Writer.Error!void {
+        try w.print("{}.{}.{}.{}:{}", .{ self.ip[0], self.ip[1], self.ip[2], self.ip[3], self.port });
     }
 };
 

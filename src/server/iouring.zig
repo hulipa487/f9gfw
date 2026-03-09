@@ -35,7 +35,7 @@ pub const UdpRing = struct {
         try std.posix.bind(fd, addr, @sizeOf(std.posix.sockaddr.in));
 
         // Setup io_uring
-        const ring = try IoUring.init(QUEUE_DEPTH, linux.IORING_SETUP_SUBMIT_ALL);
+        var ring = try IoUring.init(QUEUE_DEPTH, linux.IORING_SETUP_SUBMIT_ALL);
         errdefer ring.deinit();
 
         const buffer = try allocator.alloc(u8, BUFFER_SIZE);
@@ -56,7 +56,7 @@ pub const UdpRing = struct {
 
     /// Submit a receive request
     pub fn prepareRecv(self: *UdpRing, user_data: u64) !void {
-        const sqe = self.ring.get_sqe() orelse return error.NoSubmissionQueueEntry;
+        const sqe = try self.ring.get_sqe();
         sqe.prep_recv(self.fd, self.buffer, 0);
         sqe.user_data = user_data;
 
@@ -70,7 +70,7 @@ pub const UdpRing = struct {
         data: []const u8,
         user_data: u64,
     ) !void {
-        const sqe = self.ring.get_sqe() orelse return error.NoSubmissionQueueEntry;
+        const sqe = try self.ring.get_sqe();
         const addr = @as(*const std.posix.sockaddr, @ptrCast(&dest.any));
         sqe.prep_sendto(self.fd, data, 0, addr, @sizeOf(std.posix.sockaddr.in));
         sqe.user_data = user_data;
@@ -80,14 +80,9 @@ pub const UdpRing = struct {
 
     /// Wait for completion and get result
     pub fn waitCompletion(self: *UdpRing) !linux.io_uring_cqe {
-        var cqe: ?*linux.io_uring_cqe = null;
-        _ = self.ring.wait_cqe(&cqe);
-        if (cqe) |c| {
-            const result = c.*;
-            self.ring.cqe_seen(c);
-            return result;
-        }
-        return error.NoCompletion;
+        var cqe = try self.ring.copy_cqe();
+        self.ring.cqe_seen(&cqe);
+        return cqe;
     }
 
     /// Get the receive buffer
