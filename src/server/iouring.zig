@@ -95,6 +95,7 @@ pub const UdpRing = struct {
 pub const OpTag = enum(u64) {
     recv = 1,
     send = 2,
+    _,
 };
 
 /// Completion result

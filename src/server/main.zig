@@ -87,6 +87,10 @@ const Server = struct {
                         std.log.err("Send error: {}", .{-cqe.res});
                     }
                 },
+                _ => {
+                    // Unknown operation, ignore
+                    std.log.debug("Unknown op tag: {}", .{cqe.user_data});
+                },
             }
 
             // Periodic cleanup
