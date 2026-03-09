@@ -138,7 +138,7 @@ const Server = struct {
     }
 
     fn handleDataPacket(self: *Server, session_id: u32, tcp_packet: []u8) !void {
-        // Get or create session
+        // Get session
         const session = self.sessions.getSession(session_id) orelse {
             return error.UnknownSession;
         };
@@ -155,20 +155,17 @@ const Server = struct {
         const tcp_header = try packet.TCPHeader.parse(tcp_packet[header_len..]);
         const dest_port = tcp_header.dest_port;
 
-        // Rewrite source IP to client's original IP
-        // This makes the packet appear to come from the original client
-        const packet_copy = try self.allocator.alloc(u8, tcp_packet.len);
-        defer self.allocator.free(packet_copy);
-        @memcpy(packet_copy, tcp_packet);
+        // Inject packet as-is - client has already rewritten source IP/port to NAT values
+        _ = try self.injector.inject(tcp_packet, dest_ip, dest_port);
 
-        // Use the session's client address as the new source IP
-        const new_src_ip = @as([4]u8, @bitCast(session.client_addr.in.sa.addr));
-        try packet.rewriteSourceIP(packet_copy, new_src_ip);
-
-        // Inject packet into kernel
-        _ = try self.injector.inject(packet_copy, dest_ip, dest_port);
-
-        std.log.debug("Injected packet: {} bytes, session {}", .{ tcp_packet.len, session_id });
+        std.log.debug("Injected packet: {} bytes, session {}, src {f}:{}, dst {f}:{}", .{
+            tcp_packet.len,
+            session_id,
+            session.conn_id.src,
+            session.conn_id.src.port,
+            session.conn_id.dst,
+            dest_port,
+        });
     }
 
     fn handleConnectPacket(self: *Server, conn_info: []u8) !void {

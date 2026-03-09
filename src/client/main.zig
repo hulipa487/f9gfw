@@ -191,11 +191,6 @@ pub fn main() !void {
     };
     defer tunnel.deinit();
 
-    // Create NAT entry via TTL-limited SYN
-    tunnel.createNATEntry() catch |err| {
-        std.log.warn("Failed to create NAT entry (non-fatal): {}", .{err});
-    };
-
     // Start local listener
     var listener = LocalListener.init(&tunnel, args.local_port) catch |err| {
         std.log.err("Failed to start listener: {}", .{err});

@@ -5,15 +5,23 @@ const winsock_mod = @import("winsock.zig");
 
 const Cipher = shared.crypto.Cipher;
 const protocol = shared.protocol;
+const icmp = shared.icmp;
+const packet = shared.packet;
 const TunnelHeader = protocol.TunnelHeader;
 const Winsock = winsock_mod.Winsock;
-const TcpTunnel = winsock_mod.TcpTunnel;
+
+/// NAT info discovered via ICMP Time Exceeded
+pub const NATInfo = struct {
+    public_ip: [4]u8,
+    public_port: u16,
+};
 
 /// Client tunnel state
 pub const ClientTunnel = struct {
     allocator: std.mem.Allocator,
     cipher: Cipher,
     udp_socket: Winsock.SOCKET,
+    icmp_socket: Winsock.SOCKET,
     proxy_ip: [4]u8,
     proxy_port: u16,
     forward_ip: [4]u8,
@@ -21,8 +29,10 @@ pub const ClientTunnel = struct {
     local_port: u16,
     ttl: u8,
     session_counter: std.atomic.Value(u32),
+    nat_info: ?NATInfo,
 
     const BUFFER_SIZE: usize = 65535;
+    const ICMP_TIMEOUT_MS: i32 = 5000;
 
     /// Initialize the client tunnel
     pub fn init(
@@ -46,10 +56,19 @@ pub const ClientTunnel = struct {
         // Bind UDP socket
         try Winsock.bind(udp_socket, .{ 0, 0, 0, 0 }, 0);
 
+        // Create raw ICMP socket for NAT discovery
+        const icmp_socket: Winsock.SOCKET = Winsock.socketIcmp() catch blk: {
+            // Non-fatal: NAT discovery won't work but tunnel might still function
+            std.log.warn("Could not create ICMP socket (requires admin): NAT discovery disabled", .{});
+            break :blk Winsock.INVALID_SOCKET;
+        };
+        errdefer if (icmp_socket != Winsock.INVALID_SOCKET) Winsock.close(icmp_socket);
+
         return .{
             .allocator = allocator,
             .cipher = Cipher.init(key),
             .udp_socket = udp_socket,
+            .icmp_socket = icmp_socket,
             .proxy_ip = proxy_ip,
             .proxy_port = proxy_port,
             .forward_ip = forward_ip,
@@ -57,18 +76,96 @@ pub const ClientTunnel = struct {
             .local_port = local_port,
             .ttl = ttl,
             .session_counter = std.atomic.Value(u32).init(1),
+            .nat_info = null,
         };
     }
 
     pub fn deinit(self: *ClientTunnel) void {
         Winsock.close(self.udp_socket);
+        if (self.icmp_socket != Winsock.INVALID_SOCKET) {
+            Winsock.close(self.icmp_socket);
+        }
         Winsock.deinit();
+    }
+
+    /// Discover NAT-assigned IP and port using TTL-limited SYN and ICMP capture
+    pub fn discoverNAT(self: *ClientTunnel) !NATInfo {
+        if (self.icmp_socket == Winsock.INVALID_SOCKET) {
+            return error.ICMPSocketNotAvailable;
+        }
+
+        // Create TCP socket with TTL limit
+        const tcp_sock = try Winsock.socketTcp();
+        defer Winsock.close(tcp_sock);
+
+        // Set TTL
+        try Winsock.setTTL(tcp_sock, self.ttl);
+
+        // Bind to a specific port so we can match the ICMP response
+        try Winsock.bind(tcp_sock, .{ 0, 0, 0, 0 }, 0);
+
+        // Get local port
+        var local_addr: Winsock.sockaddr_in = undefined;
+        try Winsock.getSockName(tcp_sock, &local_addr);
+        const local_port = std.mem.bigToNative(u16, local_addr.sin_port);
+
+        std.log.debug("Sending TTL-limited SYN from local port {}", .{local_port});
+
+        // Attempt connection (will timeout due to low TTL)
+        Winsock.connect(tcp_sock, self.forward_ip, self.forward_port) catch {};
+
+        // Now wait for ICMP Time Exceeded response
+        var icmp_buf: [1024]u8 = undefined;
+        var from_ip: [4]u8 = undefined;
+        var from_port: u16 = undefined;
+
+        const start_time = std.time.milliTimestamp();
+        while (std.time.milliTimestamp() - start_time < ICMP_TIMEOUT_MS) {
+            const recv_len = Winsock.recvFrom(self.icmp_socket, &icmp_buf, &from_ip, &from_port) catch {
+                // Sleep for 10ms on Windows
+                std.os.windows.kernel32.Sleep(10);
+                continue;
+            };
+
+            // Parse ICMP Time Exceeded
+            if (icmp.parseTimeExceeded(icmp_buf[0..recv_len], from_ip)) |info| {
+                // Check if this matches our destination
+                if (std.mem.eql(u8, &info.orig_dst_ip, &self.forward_ip) and
+                    info.orig_dst_port == self.forward_port and
+                    info.orig_src_port == local_port)
+                {
+                    std.log.info("NAT discovered: {}.{}.{}.{}:{}", .{
+                        info.orig_src_ip[0],
+                        info.orig_src_ip[1],
+                        info.orig_src_ip[2],
+                        info.orig_src_ip[3],
+                        info.orig_src_port,
+                    });
+
+                    const nat_info = NATInfo{
+                        .public_ip = info.orig_src_ip,
+                        .public_port = info.orig_src_port,
+                    };
+                    self.nat_info = nat_info;
+                    return nat_info;
+                }
+            }
+        }
+
+        return error.ICMPTimeout;
     }
 
     /// Handle a local TCP connection
     pub fn handleConnection(self: *ClientTunnel, client_sock: Winsock.SOCKET) !void {
         // Allocate session ID
         const session_id = self.session_counter.fetchAdd(1, .monotonic);
+
+        // Discover NAT if not already done
+        if (self.nat_info == null) {
+            _ = self.discoverNAT() catch |err| {
+                std.log.warn("NAT discovery failed: {} - using fallback", .{err});
+            };
+        }
 
         // Send connect message to proxy
         try self.sendConnect(session_id);
@@ -123,13 +220,21 @@ pub const ClientTunnel = struct {
         try self.sendDisconnect(session_id);
     }
 
-    /// Send connect message to proxy
+    /// Send connect message to proxy with NAT-discovered source info
     fn sendConnect(self: *ClientTunnel, session_id: u32) !void {
         // Connection info: [src_ip(4)][src_port(2)][dst_ip(4)][dst_port(2)]
         var conn_info: [12]u8 = undefined;
-        // Source (we use placeholder - proxy will rewrite)
-        @memcpy(conn_info[0..4], &[_]u8{ 0, 0, 0, 0 });
-        std.mem.writeInt(u16, conn_info[4..6], self.local_port, .big);
+
+        // Use NAT-discovered IP and port if available
+        if (self.nat_info) |nat| {
+            @memcpy(conn_info[0..4], &nat.public_ip);
+            std.mem.writeInt(u16, conn_info[4..6], nat.public_port, .big);
+        } else {
+            // Fallback: use zeros (server will need to handle this case)
+            @memcpy(conn_info[0..4], &[_]u8{ 0, 0, 0, 0 });
+            std.mem.writeInt(u16, conn_info[4..6], 0, .big);
+        }
+
         // Destination
         @memcpy(conn_info[6..10], &self.forward_ip);
         std.mem.writeInt(u16, conn_info[10..12], self.forward_port, .big);
@@ -157,13 +262,43 @@ pub const ClientTunnel = struct {
 
     /// Send data to proxy
     fn sendData(self: *ClientTunnel, session_id: u32, data: []const u8) !void {
+        // If we have NAT info, rewrite source IP/port in the TCP packet
+        var data_to_send: []const u8 = data;
+        var rewritten_buf: ?[]u8 = null;
+        defer if (rewritten_buf) |buf| self.allocator.free(buf);
+
+        if (self.nat_info) |nat| {
+            // Make a copy to rewrite
+            const buf = try self.allocator.alloc(u8, data.len);
+            errdefer self.allocator.free(buf);
+            @memcpy(buf, data);
+            rewritten_buf = buf;
+            data_to_send = buf;
+
+            // Rewrite source IP and port in the TCP/IP packet
+            try packet.rewriteSourceIP(buf, nat.public_ip);
+
+            // Also rewrite source port in TCP header
+            // Parse IP header to get TCP header offset
+            const ip_header = try packet.IPv4Header.parse(buf);
+            const header_len = @as(usize, ip_header.ihl) * 4;
+
+            // Rewrite TCP source port
+            std.mem.writeInt(u16, buf[header_len..][0..2], nat.public_port, .big);
+
+            std.log.debug("Rewrote packet src to {}.{}.{}.{}:{}", .{
+                nat.public_ip[0], nat.public_ip[1], nat.public_ip[2], nat.public_ip[3],
+                nat.public_port,
+            });
+        }
+
         // Encrypt data
-        const encrypted = try self.cipher.encrypt(self.allocator, data);
+        const encrypted = try self.cipher.encrypt(self.allocator, data_to_send);
         defer self.allocator.free(encrypted);
 
         // Build tunnel header
         var header = TunnelHeader.init(session_id, .data, @intCast(encrypted.len));
-        header.checksum = protocol.calculateChecksum(&header, data);
+        header.checksum = protocol.calculateChecksum(&header, data_to_send);
 
         // Build packet
         const packet_len = TunnelHeader.SIZE + encrypted.len;
@@ -193,21 +328,6 @@ pub const ClientTunnel = struct {
 
         // Send via UDP
         _ = try Winsock.sendTo(self.udp_socket, packet_buf, self.proxy_ip, self.proxy_port);
-    }
-
-    /// Create TTL-limited SYN for NAT traversal
-    pub fn createNATEntry(self: *ClientTunnel) !void {
-        // Create a TCP connection with limited TTL
-        // This sends SYN packets that expire at ISP router,
-        // creating NAT entry without reaching destination
-        var tunnel = try TcpTunnel.initTTLLimited(
-            self.forward_ip,
-            self.forward_port,
-            self.ttl,
-        );
-        defer tunnel.deinit();
-
-        std.log.debug("Created NAT entry via TTL-limited SYN, local port: {}", .{tunnel.local_port});
     }
 };
 
@@ -249,6 +369,12 @@ pub const LocalListener = struct {
 
     pub fn run(self: *LocalListener) !void {
         std.log.info("Listening on 127.0.0.1:{}", .{self.listen_port});
+
+        // Perform initial NAT discovery
+        std.log.info("Performing NAT discovery...", .{});
+        _ = self.tunnel.discoverNAT() catch |err| {
+            std.log.warn("Initial NAT discovery failed: {} - will retry on connection", .{err});
+        };
 
         while (true) {
             var client_addr: Winsock.sockaddr_in = undefined;

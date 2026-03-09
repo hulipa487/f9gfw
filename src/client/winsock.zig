@@ -9,8 +9,10 @@ pub const Winsock = struct {
     pub const AF_INET: i32 = 2;
     pub const SOCK_STREAM: i32 = 1;
     pub const SOCK_DGRAM: i32 = 2;
+    pub const SOCK_RAW: i32 = 3;
     pub const IPPROTO_TCP: i32 = 6;
     pub const IPPROTO_UDP: i32 = 17;
+    pub const IPPROTO_ICMP: i32 = 1;
     pub const IPPROTO_IP: i32 = 0;
 
     pub const SOL_SOCKET: i32 = 0xFFFF;
@@ -69,6 +71,24 @@ pub const Winsock = struct {
     /// Create a UDP socket
     pub fn socketUdp() !SOCKET {
         const sock = wsa_socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (sock == INVALID_SOCKET) {
+            return error.SocketFailed;
+        }
+        return sock;
+    }
+
+    /// Create a raw ICMP socket (for receiving ICMP messages)
+    pub fn socketIcmp() !SOCKET {
+        const sock = wsa_socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+        if (sock == INVALID_SOCKET) {
+            return error.SocketFailed;
+        }
+        return sock;
+    }
+
+    /// Create a raw socket with specified protocol
+    pub fn socketRaw(protocol: i32) !SOCKET {
+        const sock = wsa_socket(AF_INET, SOCK_RAW, protocol);
         if (sock == INVALID_SOCKET) {
             return error.SocketFailed;
         }
@@ -231,6 +251,14 @@ pub const Winsock = struct {
         from_ip.* = @bitCast(addr.sin_addr);
         from_port.* = std.mem.bigToNative(u16, addr.sin_port);
         return @intCast(result);
+    }
+
+    /// Get socket name (local address)
+    pub fn getSockName(sock: SOCKET, addr: *sockaddr_in) !void {
+        var addr_len: i32 = @sizeOf(sockaddr_in);
+        if (wsa_getsockname(sock, @ptrCast(addr), &addr_len) == SOCKET_ERROR) {
+            return error.GetSockNameFailed;
+        }
     }
 };
 
