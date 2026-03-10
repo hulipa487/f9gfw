@@ -183,7 +183,6 @@ pub fn main() !void {
         args.proxy_port,
         forward_ip,
         args.forward_port,
-        args.local_port,
         args.ttl,
     ) catch |err| {
         std.log.err("Failed to initialize tunnel: {}", .{err});

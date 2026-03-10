@@ -2,18 +2,31 @@ const std = @import("std");
 
 const shared = @import("shared");
 const winsock_mod = @import("winsock.zig");
+const wfp_mod = @import("wfp.zig");
 
 const Cipher = shared.crypto.Cipher;
 const protocol = shared.protocol;
 const icmp = shared.icmp;
-const packet = shared.packet;
+const packet_mod = shared.packet;
 const TunnelHeader = protocol.TunnelHeader;
 const Winsock = winsock_mod.Winsock;
+const PacketCapturer = wfp_mod.PacketCapturer;
+const WinDivert = wfp_mod.WinDivert;
 
 /// NAT info discovered via ICMP Time Exceeded
 pub const NATInfo = struct {
     public_ip: [4]u8,
     public_port: u16,
+};
+
+/// Capture context for WinDivert callback
+pub const CaptureContext = struct {
+    tunnel: *ClientTunnel,
+    session_id: u32,
+    stream_b_local_port: u16,
+    nat_info: NATInfo,
+    forward_ip: [4]u8,
+    forward_port: u16,
 };
 
 /// Client tunnel state
@@ -26,10 +39,8 @@ pub const ClientTunnel = struct {
     proxy_port: u16,
     forward_ip: [4]u8,
     forward_port: u16,
-    local_port: u16,
     ttl: u8,
     session_counter: std.atomic.Value(u32),
-    nat_info: ?NATInfo,
 
     const BUFFER_SIZE: usize = 65535;
     const ICMP_TIMEOUT_MS: i32 = 5000;
@@ -42,24 +53,18 @@ pub const ClientTunnel = struct {
         proxy_port: u16,
         forward_ip: [4]u8,
         forward_port: u16,
-        local_port: u16,
         ttl: u8,
     ) !ClientTunnel {
-        // Initialize Winsock
         try Winsock.init();
         errdefer Winsock.deinit();
 
-        // Create UDP socket for tunnel traffic
         const udp_socket = try Winsock.socketUdp();
         errdefer Winsock.close(udp_socket);
-
-        // Bind UDP socket
         try Winsock.bind(udp_socket, .{ 0, 0, 0, 0 }, 0);
 
-        // Create raw ICMP socket for NAT discovery
+        // ICMP socket for capturing Time Exceeded
         const icmp_socket: Winsock.SOCKET = Winsock.socketIcmp() catch blk: {
-            // Non-fatal: NAT discovery won't work but tunnel might still function
-            std.log.warn("Could not create ICMP socket (requires admin): NAT discovery disabled", .{});
+            std.log.warn("Could not create ICMP socket (requires admin)", .{});
             break :blk Winsock.INVALID_SOCKET;
         };
         errdefer if (icmp_socket != Winsock.INVALID_SOCKET) Winsock.close(icmp_socket);
@@ -73,10 +78,8 @@ pub const ClientTunnel = struct {
             .proxy_port = proxy_port,
             .forward_ip = forward_ip,
             .forward_port = forward_port,
-            .local_port = local_port,
             .ttl = ttl,
             .session_counter = std.atomic.Value(u32).init(1),
-            .nat_info = null,
         };
     }
 
@@ -88,33 +91,91 @@ pub const ClientTunnel = struct {
         Winsock.deinit();
     }
 
-    /// Discover NAT-assigned IP and port using TTL-limited SYN and ICMP capture
-    pub fn discoverNAT(self: *ClientTunnel) !NATInfo {
+    /// Handle a local TCP connection (Stream A)
+    /// This creates Stream B (TTL-limited TCP) and tunnels via Stream C (UDP)
+    pub fn handleConnection(self: *ClientTunnel, client_sock: Winsock.SOCKET) !void {
+        const session_id = self.session_counter.fetchAdd(1, .monotonic);
+
+        // Create Stream B: TCP socket with TTL for NAT traversal
+        const stream_b_sock = try Winsock.socketTcp();
+        defer Winsock.close(stream_b_sock);
+
+        try Winsock.setTTL(stream_b_sock, self.ttl);
+        try Winsock.bind(stream_b_sock, .{ 0, 0, 0, 0 }, 0);
+
+        // Get local port of Stream B (needed to match ICMP response)
+        var local_addr: Winsock.sockaddr_in = undefined;
+        try Winsock.getSockName(stream_b_sock, &local_addr);
+        const stream_b_local_port = std.mem.bigToNative(u16, local_addr.sin_port);
+
+        std.log.info("Session {}: Stream B local port {}", .{ session_id, stream_b_local_port });
+
+        // Start non-blocking connect (sends SYN with TTL)
+        // This creates NAT entry but packet expires before reaching destination
+        Winsock.connect(stream_b_sock, self.forward_ip, self.forward_port) catch {};
+
+        // Wait for ICMP Time Exceeded to get NAT-translated src IP/port
+        const nat_info = self.waitForNATInfo(stream_b_local_port) catch |err| blk: {
+            std.log.warn("NAT discovery failed: {} - connection may not work", .{err});
+            break :blk null;
+        };
+
+        var capture_ctx: ?CaptureContext = null;
+        var capturer: ?PacketCapturer = null;
+
+        if (nat_info) |nat| {
+            std.log.info("Session {}: NAT public endpoint {}.{}.{}.{}:{}", .{
+                session_id,
+                nat.public_ip[0], nat.public_ip[1], nat.public_ip[2], nat.public_ip[3],
+                nat.public_port,
+            });
+
+            // Send connect message to proxy with NAT info
+            try self.sendConnect(session_id, nat);
+
+            // Initialize capture context for WinDivert callback
+            capture_ctx = .{
+                .tunnel = self,
+                .session_id = session_id,
+                .stream_b_local_port = stream_b_local_port,
+                .nat_info = nat,
+                .forward_ip = self.forward_ip,
+                .forward_port = self.forward_port,
+            };
+
+            // Start WinDivert packet capture
+            capturer = try PacketCapturer.init(self.allocator, .{
+                .dst_ip = self.forward_ip,
+                .dst_port = self.forward_port,
+                .protocol = 6, // TCP
+            });
+
+            try capturer.?.start(captureCallback, &capture_ctx.?);
+
+            // Small delay to ensure filter is active before we start sending
+            std.os.windows.kernel32.Sleep(100);
+        }
+
+        // Pipe data bidirectionally:
+        // Stream A (client_sock) -> Stream B (triggers WFP capture)
+        // Stream B (server responses) -> Stream A
+        // Stream C (UDP tunnel) -> Stream A
+
+        try self.pipeConnection(
+            session_id,
+            client_sock,      // Stream A
+            stream_b_sock,    // Stream B
+            nat_info,
+            &capturer,
+        );
+    }
+
+    /// Wait for ICMP Time Exceeded and extract NAT info
+    fn waitForNATInfo(self: *ClientTunnel, local_port: u16) !NATInfo {
         if (self.icmp_socket == Winsock.INVALID_SOCKET) {
             return error.ICMPSocketNotAvailable;
         }
 
-        // Create TCP socket with TTL limit
-        const tcp_sock = try Winsock.socketTcp();
-        defer Winsock.close(tcp_sock);
-
-        // Set TTL
-        try Winsock.setTTL(tcp_sock, self.ttl);
-
-        // Bind to a specific port so we can match the ICMP response
-        try Winsock.bind(tcp_sock, .{ 0, 0, 0, 0 }, 0);
-
-        // Get local port
-        var local_addr: Winsock.sockaddr_in = undefined;
-        try Winsock.getSockName(tcp_sock, &local_addr);
-        const local_port = std.mem.bigToNative(u16, local_addr.sin_port);
-
-        std.log.debug("Sending TTL-limited SYN from local port {}", .{local_port});
-
-        // Attempt connection (will timeout due to low TTL)
-        Winsock.connect(tcp_sock, self.forward_ip, self.forward_port) catch {};
-
-        // Now wait for ICMP Time Exceeded response
         var icmp_buf: [1024]u8 = undefined;
         var from_ip: [4]u8 = undefined;
         var from_port: u16 = undefined;
@@ -122,32 +183,20 @@ pub const ClientTunnel = struct {
         const start_time = std.time.milliTimestamp();
         while (std.time.milliTimestamp() - start_time < ICMP_TIMEOUT_MS) {
             const recv_len = Winsock.recvFrom(self.icmp_socket, &icmp_buf, &from_ip, &from_port) catch {
-                // Sleep for 10ms on Windows
                 std.os.windows.kernel32.Sleep(10);
                 continue;
             };
 
-            // Parse ICMP Time Exceeded
             if (icmp.parseTimeExceeded(icmp_buf[0..recv_len], from_ip)) |info| {
-                // Check if this matches our destination
+                // Match by destination and local port
                 if (std.mem.eql(u8, &info.orig_dst_ip, &self.forward_ip) and
                     info.orig_dst_port == self.forward_port and
                     info.orig_src_port == local_port)
                 {
-                    std.log.info("NAT discovered: {}.{}.{}.{}:{}", .{
-                        info.orig_src_ip[0],
-                        info.orig_src_ip[1],
-                        info.orig_src_ip[2],
-                        info.orig_src_ip[3],
-                        info.orig_src_port,
-                    });
-
-                    const nat_info = NATInfo{
+                    return .{
                         .public_ip = info.orig_src_ip,
                         .public_port = info.orig_src_port,
                     };
-                    self.nat_info = nat_info;
-                    return nat_info;
                 }
             }
         }
@@ -155,183 +204,191 @@ pub const ClientTunnel = struct {
         return error.ICMPTimeout;
     }
 
-    /// Handle a local TCP connection
-    pub fn handleConnection(self: *ClientTunnel, client_sock: Winsock.SOCKET) !void {
-        // Allocate session ID
-        const session_id = self.session_counter.fetchAdd(1, .monotonic);
+    /// Pipe data between Stream A, Stream B, and Stream C
+    fn pipeConnection(
+        self: *ClientTunnel,
+        session_id: u32,
+        stream_a: Winsock.SOCKET, // Local app connection
+        stream_b: Winsock.SOCKET, // Real TCP to server
+        _nat_info: ?NATInfo,
+        capturer: *?PacketCapturer,
+    ) !void {
+        _ = _nat_info;
+        var buf_a: [BUFFER_SIZE]u8 = undefined; // From local app
+        var buf_c: [BUFFER_SIZE]u8 = undefined; // From UDP tunnel
 
-        // Discover NAT if not already done
-        if (self.nat_info == null) {
-            _ = self.discoverNAT() catch |err| {
-                std.log.warn("NAT discovery failed: {} - using fallback", .{err});
-            };
-        }
+        // Use select() or poll() equivalent for bidirectional I/O
+        // For simplicity, we'll use non-blocking reads in a loop
 
-        // Send connect message to proxy
-        try self.sendConnect(session_id);
-
-        // Create pipes for data transfer
-        var recv_buf: [BUFFER_SIZE]u8 = undefined;
-        var send_buf: [BUFFER_SIZE]u8 = undefined;
-
-        // Simple read-forward loop
         while (true) {
-            // Read from client
-            const bytes_read = Winsock.recv(client_sock, &recv_buf) catch |err| {
-                if (err == error.ConnectionClosed) {
-                    std.log.debug("Client closed connection", .{});
+            var got_data = false;
+
+            // Read from Stream A (local app) -> forward to Stream B
+            if (Winsock.recv(stream_a, &buf_a)) |len| {
+                if (len == 0) break; // Connection closed
+                got_data = true;
+
+                // Write to Stream B (kernel will generate TCP packets)
+                // WinDivert captures these packets for tunneling
+                _ = Winsock.send(stream_b, buf_a[0..len]) catch {
+                    std.log.err("Session {}: Stream B send failed", .{session_id});
                     break;
+                };
+            } else |_| {}
+
+            // Read from Stream B (server responses) -> forward to Stream A
+            if (Winsock.recv(stream_b, &buf_a)) |len| {
+                if (len == 0) break;
+                got_data = true;
+
+                // Forward server response to local app
+                _ = Winsock.send(stream_a, buf_a[0..len]) catch {
+                    std.log.err("Session {}: Stream A send failed", .{session_id});
+                    break;
+                };
+            } else |_| {}
+
+            // Read from Stream C (UDP tunnel) -> forward to Stream A
+            // This is for responses from proxy server
+            if (Winsock.recv(self.udp_socket, &buf_c)) |len| {
+                if (len > TunnelHeader.SIZE) {
+                    got_data = true;
+                    const header = TunnelHeader.deserialize(buf_c[0..TunnelHeader.SIZE]);
+                    if (header.isValid() and header.packet_type == .data) {
+                        const encrypted = buf_c[TunnelHeader.SIZE .. TunnelHeader.SIZE + header.payload_length];
+                        if (self.cipher.decrypt(self.allocator, encrypted)) |decrypted| {
+                            defer self.allocator.free(decrypted);
+                            _ = Winsock.send(stream_a, decrypted) catch {};
+                        } else |_| {}
+                    }
                 }
-                return err;
-            };
+            } else |_| {}
 
-            if (bytes_read == 0) break;
-
-            // Forward to proxy via UDP
-            try self.sendData(session_id, recv_buf[0..bytes_read]);
-
-            // Receive response from proxy (blocking)
-            const resp_len = Winsock.recv(self.udp_socket, &send_buf) catch |err| {
-                std.log.err("Failed to receive from proxy: {}", .{err});
-                continue;
-            };
-
-            if (resp_len > TunnelHeader.SIZE) {
-                // Parse response
-                const header = TunnelHeader.deserialize(send_buf[0..TunnelHeader.SIZE]);
-                if (header.isValid() and header.packet_type == .data) {
-                    // Decrypt payload
-                    const encrypted = send_buf[TunnelHeader.SIZE .. TunnelHeader.SIZE + header.payload_length];
-                    const decrypted = self.cipher.decrypt(self.allocator, encrypted) catch {
-                        continue;
-                    };
-                    defer self.allocator.free(decrypted);
-
-                    // Send to client
-                    _ = Winsock.send(client_sock, decrypted) catch |err| {
-                        std.log.err("Failed to send to client: {}", .{err});
-                        break;
-                    };
-                }
+            if (!got_data) {
+                std.os.windows.kernel32.Sleep(1);
             }
         }
 
-        // Send disconnect message
+        // Stop capture
+        if (capturer.*) |*cap| {
+            cap.stop();
+        }
+
         try self.sendDisconnect(session_id);
     }
 
-    /// Send connect message to proxy with NAT-discovered source info
-    fn sendConnect(self: *ClientTunnel, session_id: u32) !void {
-        // Connection info: [src_ip(4)][src_port(2)][dst_ip(4)][dst_port(2)]
+    /// Send connect message to proxy
+    fn sendConnect(self: *ClientTunnel, session_id: u32, nat: NATInfo) !void {
         var conn_info: [12]u8 = undefined;
-
-        // Use NAT-discovered IP and port if available
-        if (self.nat_info) |nat| {
-            @memcpy(conn_info[0..4], &nat.public_ip);
-            std.mem.writeInt(u16, conn_info[4..6], nat.public_port, .big);
-        } else {
-            // Fallback: use zeros (server will need to handle this case)
-            @memcpy(conn_info[0..4], &[_]u8{ 0, 0, 0, 0 });
-            std.mem.writeInt(u16, conn_info[4..6], 0, .big);
-        }
-
-        // Destination
+        @memcpy(conn_info[0..4], &nat.public_ip);
+        std.mem.writeInt(u16, conn_info[4..6], nat.public_port, .big);
         @memcpy(conn_info[6..10], &self.forward_ip);
         std.mem.writeInt(u16, conn_info[10..12], self.forward_port, .big);
 
-        // Encrypt connection info
         const encrypted = try self.cipher.encrypt(self.allocator, &conn_info);
         defer self.allocator.free(encrypted);
 
-        // Build tunnel header
         var header = TunnelHeader.init(session_id, .connect, @intCast(encrypted.len));
         header.checksum = protocol.calculateChecksum(&header, &conn_info);
 
-        // Build packet
-        const packet_len = TunnelHeader.SIZE + encrypted.len;
-        const packet_buf = try self.allocator.alloc(u8, packet_len);
+        const packet_buf = try self.allocator.alloc(u8, TunnelHeader.SIZE + encrypted.len);
         defer self.allocator.free(packet_buf);
 
         const serialized = header.serialize();
         @memcpy(packet_buf[0..TunnelHeader.SIZE], &serialized);
         @memcpy(packet_buf[TunnelHeader.SIZE..], encrypted);
 
-        // Send via UDP
-        _ = try Winsock.sendTo(self.udp_socket, packet_buf, self.proxy_ip, self.proxy_port);
-    }
-
-    /// Send data to proxy
-    fn sendData(self: *ClientTunnel, session_id: u32, data: []const u8) !void {
-        // If we have NAT info, rewrite source IP/port in the TCP packet
-        var data_to_send: []const u8 = data;
-        var rewritten_buf: ?[]u8 = null;
-        defer if (rewritten_buf) |buf| self.allocator.free(buf);
-
-        if (self.nat_info) |nat| {
-            // Make a copy to rewrite
-            const buf = try self.allocator.alloc(u8, data.len);
-            errdefer self.allocator.free(buf);
-            @memcpy(buf, data);
-            rewritten_buf = buf;
-            data_to_send = buf;
-
-            // Rewrite source IP and port in the TCP/IP packet
-            try packet.rewriteSourceIP(buf, nat.public_ip);
-
-            // Also rewrite source port in TCP header
-            // Parse IP header to get TCP header offset
-            const ip_header = try packet.IPv4Header.parse(buf);
-            const header_len = @as(usize, ip_header.ihl) * 4;
-
-            // Rewrite TCP source port
-            std.mem.writeInt(u16, buf[header_len..][0..2], nat.public_port, .big);
-
-            std.log.debug("Rewrote packet src to {}.{}.{}.{}:{}", .{
-                nat.public_ip[0], nat.public_ip[1], nat.public_ip[2], nat.public_ip[3],
-                nat.public_port,
-            });
-        }
-
-        // Encrypt data
-        const encrypted = try self.cipher.encrypt(self.allocator, data_to_send);
-        defer self.allocator.free(encrypted);
-
-        // Build tunnel header
-        var header = TunnelHeader.init(session_id, .data, @intCast(encrypted.len));
-        header.checksum = protocol.calculateChecksum(&header, data_to_send);
-
-        // Build packet
-        const packet_len = TunnelHeader.SIZE + encrypted.len;
-        const packet_buf = try self.allocator.alloc(u8, packet_len);
-        defer self.allocator.free(packet_buf);
-
-        const serialized = header.serialize();
-        @memcpy(packet_buf[0..TunnelHeader.SIZE], &serialized);
-        @memcpy(packet_buf[TunnelHeader.SIZE..], encrypted);
-
-        // Send via UDP
         _ = try Winsock.sendTo(self.udp_socket, packet_buf, self.proxy_ip, self.proxy_port);
     }
 
     /// Send disconnect message
     fn sendDisconnect(self: *ClientTunnel, session_id: u32) !void {
-        // Build tunnel header
         var header = TunnelHeader.init(session_id, .disconnect, 0);
         header.checksum = protocol.calculateChecksum(&header, &[_]u8{});
 
-        // Build packet
         const packet_buf = try self.allocator.alloc(u8, TunnelHeader.SIZE);
         defer self.allocator.free(packet_buf);
 
         const serialized = header.serialize();
         @memcpy(packet_buf[0..TunnelHeader.SIZE], &serialized);
 
-        // Send via UDP
         _ = try Winsock.sendTo(self.udp_socket, packet_buf, self.proxy_ip, self.proxy_port);
     }
 };
 
-/// Local TCP listener that accepts connections and tunnels them
+/// WinDivert capture callback - called for each captured packet
+fn captureCallback(packet: []const u8, _addr: *const WinDivert.ADDR, user_data: *anyopaque) void {
+    _ = _addr;
+    const ctx = @as(*CaptureContext, @ptrCast(@alignCast(user_data)));
+
+    // Parse the captured packet
+    const ip_header = packet_mod.IPv4Header.parse(packet[0..]) catch {
+        std.log.warn("Failed to parse IP header", .{});
+        return;
+    };
+
+    // Only capture TCP packets from our Stream B socket
+    if (ip_header.protocol != 6) return;
+
+    const header_len = @as(usize, ip_header.ihl) * 4;
+    if (packet.len < header_len + packet_mod.TCPHeader.MIN_SIZE) return;
+
+    const tcp_header = packet_mod.TCPHeader.parse(packet[header_len..]) catch return;
+
+    // Verify this is from our Stream B socket (check source port)
+    if (tcp_header.source_port != ctx.stream_b_local_port) return;
+
+    // Rewrite source IP and port to NAT-discovered values
+    var packet_buf = std.heap.page_allocator.alloc(u8, packet.len) catch return;
+    defer std.heap.page_allocator.free(packet_buf);
+    @memcpy(packet_buf, packet);
+
+    // Rewrite to NAT public IP/port
+    const new_src_addr = std.mem.nativeToBig(u32, @bitCast(ctx.nat_info.public_ip));
+    std.mem.writeInt(u32, packet_buf[12..16], new_src_addr, .big);
+    std.mem.writeInt(u16, packet_buf[header_len..][0..2], ctx.nat_info.public_port, .big);
+
+    // Recalculate IP checksum
+    const ip_cksum = packet_mod.checksumIPv4(packet_buf[0..header_len]);
+    std.mem.writeInt(u16, packet_buf[10..12], ip_cksum, .big);
+
+    // Recalculate TCP checksum
+    std.mem.writeInt(u16, packet_buf[header_len + 16 ..][0..2], 0, .big);
+    const tcp_cksum = packet_mod.checksumTCP(
+        packet_buf[header_len .. header_len + 20],
+        if (packet.len > header_len + 20) packet_buf[header_len + 20..] else &[_]u8{},
+        ctx.nat_info.public_ip,
+        ip_header.getDestIP(),
+    );
+    std.mem.writeInt(u16, packet_buf[header_len + 16 ..][0..2], tcp_cksum, .big);
+
+    // Encrypt the rewritten packet
+    const cipher = &ctx.tunnel.cipher;
+    const encrypted = cipher.encrypt(ctx.tunnel.allocator, packet_buf) catch {
+        std.log.err("Session {}: Encryption failed", .{ctx.session_id});
+        return;
+    };
+    defer ctx.tunnel.allocator.free(encrypted);
+
+    // Build tunnel packet
+    var header = TunnelHeader.init(ctx.session_id, .data, @intCast(encrypted.len));
+    header.checksum = protocol.calculateChecksum(&header, packet_buf);
+
+    const packet_buf_total = ctx.tunnel.allocator.alloc(u8, TunnelHeader.SIZE + encrypted.len) catch return;
+    defer ctx.tunnel.allocator.free(packet_buf_total);
+
+    const serialized = header.serialize();
+    @memcpy(packet_buf_total[0..TunnelHeader.SIZE], &serialized);
+    @memcpy(packet_buf_total[TunnelHeader.SIZE..], encrypted);
+
+    // Send via UDP to proxy
+    _ = Winsock.sendTo(ctx.tunnel.udp_socket, packet_buf_total, ctx.tunnel.proxy_ip, ctx.tunnel.proxy_port) catch {
+        std.log.err("Session {}: UDP send failed", .{ctx.session_id});
+        return;
+    };
+}
+
+/// Local TCP listener
 pub const LocalListener = struct {
     tunnel: *ClientTunnel,
     listen_sock: Winsock.SOCKET,
@@ -341,19 +398,10 @@ pub const LocalListener = struct {
         const sock = try Winsock.socketTcp();
         errdefer Winsock.close(sock);
 
-        // Set reuse address
         var opt: u32 = 1;
-        _ = winsock_mod.setsockopt_internal(
-            sock,
-            Winsock.SOL_SOCKET,
-            Winsock.SO_REUSEADDR,
-            @ptrCast(&opt),
-            @sizeOf(u32),
-        );
+        _ = winsock_mod.setsockopt_internal(sock, Winsock.SOL_SOCKET, Winsock.SO_REUSEADDR, @ptrCast(&opt), @sizeOf(u32));
 
         try Winsock.bind(sock, .{ 127, 0, 0, 1 }, port);
-
-        // Listen
         try Winsock.listen(sock, 5);
 
         return .{
@@ -370,28 +418,17 @@ pub const LocalListener = struct {
     pub fn run(self: *LocalListener) !void {
         std.log.info("Listening on 127.0.0.1:{}", .{self.listen_port});
 
-        // Perform initial NAT discovery
-        std.log.info("Performing NAT discovery...", .{});
-        _ = self.tunnel.discoverNAT() catch |err| {
-            std.log.warn("Initial NAT discovery failed: {} - will retry on connection", .{err});
-        };
-
         while (true) {
             var client_addr: Winsock.sockaddr_in = undefined;
             var client_addr_len: i32 = @sizeOf(Winsock.sockaddr_in);
 
-            const client_sock = Winsock.accept(
-                self.listen_sock,
-                &client_addr,
-                &client_addr_len,
-            ) catch {
+            const client_sock = Winsock.accept(self.listen_sock, &client_addr, &client_addr_len) catch {
                 std.log.err("Accept failed", .{});
                 continue;
             };
 
             std.log.info("Accepted connection", .{});
 
-            // Handle connection in same thread (could spawn thread for concurrency)
             self.tunnel.handleConnection(client_sock) catch |err| {
                 std.log.err("Connection error: {}", .{err});
             };
